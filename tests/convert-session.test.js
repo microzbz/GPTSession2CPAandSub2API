@@ -57,7 +57,7 @@ function loadPageScript() {
   assert.ok(match, "expected docs/index.html to contain one inline script");
 
   const elements = new Map();
-  const formatButtons = ["sub2api", "cpa", "cockpit", "9router"].map((format) =>
+  const formatButtons = ["sub2api", "cpa", "cockpit", "9router", "axonhub"].map((format) =>
     createFakeElement(`[data-format="${format}"]`, { dataset: { format } })
   );
 
@@ -149,5 +149,70 @@ function testSyntheticIdTokenHasCodexParseableJwtFormat() {
   assert.equal(payload["https://api.openai.com/auth"].chatgpt_account_id, "00000000-0000-4000-9000-000000000000");
 }
 
+function testAxonHubAuthJsonUsesPlaceholderRefreshTokenWhenMissing() {
+  const { elements, formatButtons } = loadPageScript();
+  const axonHubButton = formatButtons.find((button) => button.dataset.format === "axonhub");
+  const input = elements.get("#session-input");
+  const output = elements.get("#output");
+
+  dispatch(axonHubButton, "click");
+  input.value = JSON.stringify({
+    user: {
+      id: "user-test",
+      email: "mark@example.com",
+    },
+    expires: "2026-08-06T14:29:36.155Z",
+    account: {
+      id: "00000000-0000-4000-9000-000000000000",
+      planType: "plus",
+    },
+    accessToken: "access-token",
+    sessionToken: "session-token",
+  });
+  dispatch(input, "input");
+
+  const authJson = JSON.parse(output.value);
+
+  assert.equal(authJson.auth_mode, "chatgpt");
+  assert.equal(authJson.tokens.access_token, "access-token");
+  assert.equal(authJson.tokens.refresh_token, "__missing_refresh_token__");
+  assert.equal(authJson.tokens.id_token.split(".").length, 3);
+  assert.equal(authJson.last_refresh, "2026-08-06T13:29:36.155Z");
+  assert.equal(authJson.axonhub_refresh_token_placeholder, true);
+  assert.equal(authJson.axonhub_note, "refresh_token is a placeholder; access_token works only until it expires.");
+}
+
+function testAxonHubAuthJsonPreservesRealRefreshToken() {
+  const { elements, formatButtons } = loadPageScript();
+  const axonHubButton = formatButtons.find((button) => button.dataset.format === "axonhub");
+  const input = elements.get("#session-input");
+  const output = elements.get("#output");
+
+  dispatch(axonHubButton, "click");
+  input.value = JSON.stringify({
+    user: {
+      email: "mark@example.com",
+    },
+    expires: "2026-08-06T14:29:36.155Z",
+    account: {
+      id: "00000000-0000-4000-9000-000000000000",
+      planType: "plus",
+    },
+    accessToken: "access-token",
+    refreshToken: "real-refresh-token",
+    idToken: "real.header.signature",
+  });
+  dispatch(input, "input");
+
+  const authJson = JSON.parse(output.value);
+
+  assert.equal(authJson.tokens.refresh_token, "real-refresh-token");
+  assert.equal(authJson.tokens.id_token, "real.header.signature");
+  assert.equal(authJson.axonhub_refresh_token_placeholder, undefined);
+  assert.equal(authJson.axonhub_note, undefined);
+}
+
 testSyntheticIdTokenHasCodexParseableJwtFormat();
+testAxonHubAuthJsonUsesPlaceholderRefreshTokenWhenMissing();
+testAxonHubAuthJsonPreservesRealRefreshToken();
 console.log("convert-session tests passed");

@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>ChatGPT Session -> CPA / sub2api / Cockpit</title>
+    <title>ChatGPT Session -> CPA / sub2api / Cockpit / AxonHub</title>
     <meta name="theme-color" content="#24505a" />
     <link rel="icon" href="./favicon.svg" type="image/svg+xml" sizes="any" />
     <style>
@@ -158,8 +158,8 @@
 
       .segmented {
         display: inline-grid;
-        grid-template-columns: repeat(4, minmax(0, 1fr));
-        width: min(480px, 100%);
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+        width: min(590px, 100%);
         padding: 4px;
         border: 1px solid var(--line);
         border-radius: var(--radius);
@@ -627,6 +627,7 @@
             <span>sub2api</span>
             <span>Cockpit</span>
             <span>9router</span>
+            <span>AxonHub</span>
           </div>
         </div>
         <div class="meta-row" aria-label="处理方式">
@@ -654,6 +655,7 @@
           <button type="button" data-format="cpa" aria-pressed="false">CPA</button>
           <button type="button" data-format="cockpit" aria-pressed="false">Cockpit</button>
           <button type="button" data-format="9router" aria-pressed="false">9router</button>
+          <button type="button" data-format="axonhub" aria-pressed="false">AxonHub</button>
         </div>
         <div class="actions">
           <button class="button button-secondary" id="copy-output" type="button" disabled>复制输出</button>
@@ -715,7 +717,7 @@
           </div>
           <div class="panel-body">
             <p class="notice" id="cpa-notice">
-              ChatGPT Web session 一般没有 `refresh_token`；缺少真实 `id_token` 时会构造 Codex 可解析的占位 JWT claims，实际调用仍依赖 access token。
+              ChatGPT Web session 一般没有 `refresh_token`；缺少真实 `id_token` 时会构造 Codex 可解析的占位 JWT claims。AxonHub 缺少真实 `refresh_token` 时会写入占位值，access token 过期后不能自动刷新。
             </p>
             <div class="summary" aria-label="转换统计">
               <div class="stat">
@@ -769,6 +771,7 @@
           cpa: "CPA",
           cockpit: "Cockpit",
           "9router": "9router",
+          axonhub: "AxonHub",
         };
 
         const state = {
@@ -814,6 +817,8 @@
           sessionToken: "paste-real-session-token-here",
           authProvider: "openai",
         };
+
+        const AXONHUB_PLACEHOLDER_REFRESH_TOKEN = "__missing_refresh_token__";
 
         function isPlainObject(value) {
           return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -977,6 +982,15 @@
           }
 
           return Math.max(0, Math.floor((expiresMs - now.getTime()) / 1000));
+        }
+
+        function getAxonHubLastRefresh(expiresAt, now = new Date()) {
+          const expiresMs = expiresAt ? new Date(expiresAt).getTime() : NaN;
+          if (Number.isNaN(expiresMs)) {
+            return normalizeTimestamp(now);
+          }
+
+          return new Date(expiresMs - 60 * 60 * 1000).toISOString();
         }
 
         function stripUnavailable(value) {
@@ -1295,6 +1309,18 @@
             createdAt,
             updatedAt,
           });
+          const axonHubRefreshToken = refreshToken || AXONHUB_PLACEHOLDER_REFRESH_TOKEN;
+          const axonHub = stripUnavailable({
+            auth_mode: "chatgpt",
+            last_refresh: getAxonHubLastRefresh(expiresAt, options.now || new Date()),
+            tokens: {
+              access_token: accessToken,
+              refresh_token: axonHubRefreshToken,
+              id_token: idToken,
+            },
+            axonhub_refresh_token_placeholder: refreshToken ? undefined : true,
+            axonhub_note: refreshToken ? undefined : "refresh_token is a placeholder; access_token works only until it expires.",
+          });
 
           return {
             sourceName,
@@ -1305,6 +1331,7 @@
             cpa,
             cockpit,
             nineRouter,
+            axonHub,
             sub2apiAccount,
           };
         }
@@ -1339,6 +1366,12 @@
             return state.converted.length === 1
               ? state.converted[0].nineRouter
               : state.converted.map((item) => item.nineRouter);
+          }
+
+          if (state.format === "axonhub") {
+            return state.converted.length === 1
+              ? state.converted[0].axonHub
+              : state.converted.map((item) => item.axonHub);
           }
 
           return buildSub2apiDocument(state.converted, now);
