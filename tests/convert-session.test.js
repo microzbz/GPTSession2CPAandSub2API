@@ -14,11 +14,14 @@ function createFakeElement(selector, options = {}) {
     dataset: options.dataset || {},
     disabled: false,
     files: [],
+    href: "",
     innerHTML: "",
     listeners: {},
+    download: "",
     style: {},
     textContent: "",
     value: "",
+    _onClick: options.onClick,
     classList: {
       add(name) {
         classes.add(name);
@@ -40,6 +43,7 @@ function createFakeElement(selector, options = {}) {
     append() {},
     click() {
       this.listeners.click?.({ target: this });
+      this._onClick?.(this);
     },
     remove() {},
     select() {},
@@ -57,6 +61,9 @@ function loadPageScript() {
   assert.ok(match, "expected docs/index.html to contain one inline script");
 
   const elements = new Map();
+  const blobByUrl = new Map();
+  const downloads = [];
+  let blobId = 0;
   const formatButtons = ["sub2api", "cpa", "cockpit", "9router", "codex", "axonhub", "codexmanager"].map((format) =>
     createFakeElement(`[data-format="${format}"]`, { dataset: { format } })
   );
@@ -64,6 +71,17 @@ function loadPageScript() {
   const document = {
     body: createFakeElement("body"),
     createElement(selector) {
+      if (selector === "a") {
+        return createFakeElement(selector, {
+          onClick(anchor) {
+            downloads.push({
+              blob: blobByUrl.get(anchor.href),
+              fileName: anchor.download,
+              href: anchor.href,
+            });
+          },
+        });
+      }
       return createFakeElement(selector);
     },
     execCommand() {
@@ -83,9 +101,13 @@ function loadPageScript() {
   const context = {
     TextDecoder,
     TextEncoder,
+    Blob,
     URL: {
-      createObjectURL() {
-        return "blob:test";
+      createObjectURL(blob) {
+        const url = `blob:test-${blobId}`;
+        blobId += 1;
+        blobByUrl.set(url, blob);
+        return url;
       },
       revokeObjectURL() {},
     },
@@ -104,7 +126,7 @@ function loadPageScript() {
 
   vm.runInNewContext(match[1], context, { filename: "docs/index.html" });
 
-  return { elements, formatButtons };
+  return { downloads, elements, formatButtons };
 }
 
 function dispatch(element, type) {
@@ -118,6 +140,47 @@ function jwtWithPayload(payload) {
     Buffer.from(JSON.stringify(payload)).toString("base64url"),
     "sig",
   ].join(".");
+}
+
+async function readStoredZipEntries(blob) {
+  const buffer = Buffer.from(await blob.arrayBuffer());
+  let endOffset = -1;
+  for (let offset = buffer.length - 22; offset >= 0; offset -= 1) {
+    if (buffer.readUInt32LE(offset) === 0x06054b50) {
+      endOffset = offset;
+      break;
+    }
+  }
+
+  assert.notEqual(endOffset, -1, "expected ZIP end of central directory");
+
+  const entryCount = buffer.readUInt16LE(endOffset + 10);
+  const centralOffset = buffer.readUInt32LE(endOffset + 16);
+  const entries = {};
+  let pointer = centralOffset;
+
+  for (let index = 0; index < entryCount; index += 1) {
+    assert.equal(buffer.readUInt32LE(pointer), 0x02014b50, "expected central directory header");
+    assert.equal(buffer.readUInt16LE(pointer + 10), 0, "expected stored ZIP entry");
+
+    const size = buffer.readUInt32LE(pointer + 24);
+    const nameLength = buffer.readUInt16LE(pointer + 28);
+    const extraLength = buffer.readUInt16LE(pointer + 30);
+    const commentLength = buffer.readUInt16LE(pointer + 32);
+    const localOffset = buffer.readUInt32LE(pointer + 42);
+    const nameStart = pointer + 46;
+    const name = buffer.subarray(nameStart, nameStart + nameLength).toString("utf8");
+
+    assert.equal(buffer.readUInt32LE(localOffset), 0x04034b50, "expected local file header");
+    const localNameLength = buffer.readUInt16LE(localOffset + 26);
+    const localExtraLength = buffer.readUInt16LE(localOffset + 28);
+    const dataStart = localOffset + 30 + localNameLength + localExtraLength;
+    entries[name] = buffer.subarray(dataStart, dataStart + size).toString("utf8");
+
+    pointer += 46 + nameLength + extraLength + commentLength;
+  }
+
+  return entries;
 }
 
 function testSub2apiAccountUsesAccessTokenExpiry() {
@@ -438,14 +501,78 @@ function testCodexManagerAuthJsonPreservesRealRefreshAndMetadata() {
   assert.equal(authJson.meta.chatgpt_account_id, "chatgpt-account-1");
 }
 
-testSub2apiAccountUsesAccessTokenExpiry();
-testSub2apiAccountsUseTheirOwnAccessTokenExpiry();
-testSub2apiAccountWithRefreshTokenOmitsAccessTokenExpiry();
-testSyntheticIdTokenHasCodexParseableJwtFormat();
-testAxonHubAuthJsonUsesPlaceholderRefreshTokenWhenMissing();
-testAxonHubAuthJsonPreservesRealRefreshToken();
-testCodexAuthJsonMatchesNativeShapeWhenMissingRefreshToken();
-testCodexAuthJsonPreservesRealRefreshTokenAndIdToken();
-testCodexManagerAuthJsonUsesEmptyRefreshTokenWhenMissing();
-testCodexManagerAuthJsonPreservesRealRefreshAndMetadata();
-console.log("convert-session tests passed");
+async function testMultipleAccountDownloadCreatesZipWithOneJsonPerAccount() {
+  const { downloads, elements, formatButtons } = loadPageScript();
+  const cpaButton = formatButtons.find((button) => button.dataset.format === "cpa");
+  const input = elements.get("#session-input");
+  const output = elements.get("#output");
+  const downloadButton = elements.get("#download-output");
+
+  dispatch(cpaButton, "click");
+  input.value = JSON.stringify([
+    {
+      user: {
+        email: "one@example.com",
+      },
+      account: {
+        id: "account-one",
+      },
+      accessToken: "access-token-one",
+    },
+    {
+      user: {
+        email: "two@example.com",
+      },
+      account: {
+        id: "account-two",
+      },
+      accessToken: "access-token-two",
+    },
+  ]);
+  dispatch(input, "input");
+
+  assert.equal(downloadButton.textContent, "下载 ZIP");
+  assert.equal(JSON.parse(output.value).length, 2);
+
+  dispatch(downloadButton, "click");
+
+  assert.equal(downloads.length, 1);
+  assert.match(downloads[0].fileName, /\.cpa\.2-accounts\.\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.zip$/);
+  assert.equal(downloads[0].blob.type, "application/zip");
+
+  const entries = await readStoredZipEntries(downloads[0].blob);
+  const names = Object.keys(entries).sort();
+  const documents = names.map((name) => JSON.parse(entries[name]));
+
+  assert.equal(names.length, 2);
+  assert.ok(names.every((name) => name.endsWith(".cpa.json")));
+  assert.ok(documents.every((document) => !Array.isArray(document)));
+  assert.deepEqual(
+    documents.map((document) => document.email).sort(),
+    ["one@example.com", "two@example.com"],
+  );
+  assert.deepEqual(
+    documents.map((document) => document.access_token).sort(),
+    ["access-token-one", "access-token-two"],
+  );
+}
+
+async function main() {
+  testSub2apiAccountUsesAccessTokenExpiry();
+  testSub2apiAccountsUseTheirOwnAccessTokenExpiry();
+  testSub2apiAccountWithRefreshTokenOmitsAccessTokenExpiry();
+  testSyntheticIdTokenHasCodexParseableJwtFormat();
+  testAxonHubAuthJsonUsesPlaceholderRefreshTokenWhenMissing();
+  testAxonHubAuthJsonPreservesRealRefreshToken();
+  testCodexAuthJsonMatchesNativeShapeWhenMissingRefreshToken();
+  testCodexAuthJsonPreservesRealRefreshTokenAndIdToken();
+  testCodexManagerAuthJsonUsesEmptyRefreshTokenWhenMissing();
+  testCodexManagerAuthJsonPreservesRealRefreshAndMetadata();
+  await testMultipleAccountDownloadCreatesZipWithOneJsonPerAccount();
+  console.log("convert-session tests passed");
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
